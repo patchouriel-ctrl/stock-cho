@@ -17,5 +17,7 @@
 <body>
 <div id="app"><div class="center"><p class="muted">読み込んでいます…</p></div></div>
 <div id="toast" hidden></div>
+<!-- レシートを撮る（画面の書き換えで消えないよう、#app の外に置く） -->
+<input type="file" id="receipt-file" accept="image/*" capture="environment" hidden>
 </body>
 </html>

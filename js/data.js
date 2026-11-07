@@ -6,6 +6,7 @@
 //   store.remove(id)           品目を消す
 //   store.batch(list)          [{id, patch}] をまとめて書き換える
 //   store.log(entry)           購入などの記録を残す（④ の予測に使う）
+//   store.getMeta(name) / store.setMeta(name, data)  品目以外の覚え書き（レシートの読み飛ばしなど）
 //   store.user / store.signOut()
 import { firebaseConfig } from './config.js';
 
@@ -15,6 +16,7 @@ const SDK = 'https://www.gstatic.com/firebasejs/12.0.0';
 export function testStore() {
   const KEY = 'stock-cho-test';
   let state = JSON.parse(localStorage.getItem(KEY) || '{"items":{},"logs":[]}');
+  state.meta ||= {};
   const subs = new Set();
   const save = () => {
     localStorage.setItem(KEY, JSON.stringify(state));
@@ -31,6 +33,8 @@ export function testStore() {
     async remove(id) { delete state.items[id]; save(); },
     async batch(list) { for (const { id, patch } of list) Object.assign(state.items[id], patch, { updatedAt: Date.now() }); save(); },
     async log(entry) { state.logs.push({ ...entry, at: Date.now() }); save(); },
+    async getMeta(name) { return state.meta[name] || {}; },
+    async setMeta(name, data) { state.meta[name] = { ...state.meta[name], ...data }; save(); },
     async signOut() { localStorage.removeItem(KEY); location.reload(); },
   };
 }
@@ -114,6 +118,10 @@ export async function firebaseStore(user) {
       b.commit().catch(console.error);
     },
     async log(entry) { addDoc(logs, { ...entry, at: serverTimestamp() }).catch(console.error); },
+    async getMeta(name) {
+      try { const s = await getDoc(doc(home, 'meta', name)); return s.exists() ? s.data() : {}; } catch (e) { console.warn('覚え書き', e); return {}; }
+    },
+    async setMeta(name, data) { setDoc(doc(home, 'meta', name), data, { merge: true }).catch(console.error); },
     async signOut() { await authM.signOut(auth); location.reload(); },
   };
 }

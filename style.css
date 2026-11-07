@@ -124,3 +124,12 @@ h2 { font-size: 20px; margin: 0; }
 
 #toast { position: fixed; left: 50%; transform: translateX(-50%); top: calc(12px + var(--safe-t)); background: rgba(35,32,27,.9); color: #fff; padding: 10px 16px; border-radius: 20px; font-size: 14px; z-index: 20; max-width: 90vw; }
 [hidden] { display: none !important; }
+
+/* レシートの中身 */
+.rc-row { padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
+.rc-row.skip .name { color: var(--muted); }
+.rc-row.unsure { background: var(--warn-soft); }
+.rc-top { display: flex; align-items: center; gap: 10px; }
+.rc-top select { flex: none; max-width: 46%; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); }
+.rc-n { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.warn-text { color: var(--warn); }

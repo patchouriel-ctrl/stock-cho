@@ -1,9 +1,10 @@
 // ストック帳の画面。タブは「買い物」「在庫」「設定」の 3 つ。
 import { testStore, currentUser, signIn, firebaseStore } from './data.js';
 import { TEMPLATE, CATEGORIES } from './template.js';
-import { LEVELS, normalize, stockText, isUnknown, lowReason, shoppingList, afterBuy, matches } from './logic.js';
+import { LEVELS, normalize, stockText, isUnknown, lowReason, shoppingList, afterBuy, matches, planReceipt, applyReceipt } from './logic.js';
+import { readReceipt } from './receipt.js';
 
-export const VERSION = 'v2';
+export const VERSION = 'v3';
 const TEST = new URLSearchParams(location.search).has('test');
 const $app = document.getElementById('app');
 
@@ -11,7 +12,7 @@ let store = null;
 let items = [];
 let tab = 'shop';
 let query = '';
-let sheet = null; // 開いている下からの画面 { type: 'edit', id } / { type: 'template' }
+let sheet = null; // 開いている下からの画面 { type: 'edit', id } / { type: 'template' } / { type: 'receipt', phase, rows }
 
 // ピンチやダブルタップで画面が拡大されないようにする（iPhone の Safari は viewport の指定だけでは拡大を止めない）
 for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
@@ -76,6 +77,7 @@ function renderError(title, e) {
 
 // ---------- 画面全体 ----------
 function render() {
+  const sheetTop = document.querySelector('.sheet')?.scrollTop ?? 0;
   const list = shoppingList(items);
   const count = list.low.length + list.manual.length;
   $app.innerHTML = `
@@ -87,6 +89,9 @@ function render() {
       ${tabBtn('settings', '設定')}
     </nav>
     ${sheet ? sheetView() : ''}`;
+  // 下からの画面の中で押したとき、一番上に戻らないようにする
+  const sh = document.querySelector('.sheet');
+  if (sh) sh.scrollTop = sheetTop;
 }
 
 function tabBtn(key, label, badge) {
@@ -118,7 +123,7 @@ function shopView({ low, manual, unknown }) {
       ${fixBtn(it, reason)}
     </li>`).join('');
   return `
-    <header class="head"><h1>今日の買い物</h1></header>
+    <header class="head"><h1>今日の買い物</h1><button class="primary" data-action="receipt">📷 レシート</button></header>
     ${!low.length && !manual.length ? '<p class="empty">いま買う物はありません 🎉</p>' : ''}
     ${low.length ? `<h2 class="sec">在庫が少ない</h2><ul class="list">${rows(low)}</ul>` : ''}
     ${manual.length ? `<h2 class="sec">リストに入れた物</h2><ul class="list">${rows(manual)}</ul>` : ''}
@@ -195,7 +200,7 @@ function settingsView() {
 // ---------- 下からの画面（編集・ひな形） ----------
 function sheetView() {
   return `<div class="overlay" data-action="close-sheet"></div>
-    <div class="sheet">${sheet.type === 'template' ? templateSheet() : sheet.type === 'qty' ? qtySheet() : editSheet()}</div>`;
+    <div class="sheet">${sheet.type === 'template' ? templateSheet() : sheet.type === 'qty' ? qtySheet() : sheet.type === 'receipt' ? receiptSheet() : editSheet()}</div>`;
 }
 
 // 在庫の量を直す画面（在庫タブの数字、買い物タブの「在庫を直す」から開く）
@@ -216,6 +221,79 @@ function qtySheet() {
       <button class="primary" type="submit">決定</button>
     </form>
     ${it.onList ? `<button class="ghost" data-action="unlist" data-id="${it.id}">買い物リストから外すだけ（在庫は直さない）</button>` : ''}`;
+}
+
+// レシートを読んだ結果。行ごとに「どの品目か／新しく足す／読み飛ばす」を選んで、まとめて在庫に入れる。
+function receiptSheet() {
+  const head = title => `<div class="sheet-head"><h2>${title}</h2><button class="ghost" data-action="close-sheet">閉じる</button></div>`;
+  if (sheet.phase === 'reading') return `${head('レシートを読んでいます')}<p class="muted center-text">10 秒ほどかかります…</p>`;
+  if (sheet.phase === 'error') return `${head('読み取れませんでした')}
+    <p class="error">${esc(sheet.error)}</p>
+    <button class="primary big" data-action="receipt">もう一度撮る</button>`;
+  const sorted = [...items].sort(byOrder);
+  const rows = sheet.rows.map((r, i) => {
+    const it = byId(r.choice);
+    const showN = r.choice === 'new' || it?.kind === 'count';
+    const unit = it ? it.unit : '個';
+    const ask = r.unsure && r.choice === 'skip';
+    return `<li class="rc-row ${r.choice === 'skip' ? 'skip' : ''} ${ask ? 'unsure' : ''}">
+      <div class="rc-top">
+        <div class="grow"><div class="name">${esc(r.name)}</div>
+          <div class="sub">${esc(r.text)}${r.price ? `・${r.price}円` : ''}</div></div>
+        <select data-rc="${i}">
+          <option value="skip" ${r.choice === 'skip' ? 'selected' : ''}>読み飛ばす</option>
+          <option value="new" ${r.choice === 'new' ? 'selected' : ''}>＋ 新しい品目にする</option>
+          ${sorted.map(x => `<option value="${x.id}" ${r.choice === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
+        </select>
+      </div>
+      ${ask ? '<div class="sub warn-text">うちの品目にない物です。在庫で管理するなら選んでください（読み飛ばすと次からも読み飛ばします）</div>' : ''}
+      ${showN ? `<div class="rc-n"><span class="sub">${it?.kind === 'count' ? `在庫に足す数（いま ${it.qty ?? '不明'}${esc(unit)}）` : '在庫の数'}</span>
+        <div class="stepper small">
+          <button data-action="rc-n" data-i="${i}" data-d="-1" ${r.n <= 1 ? 'disabled' : ''}>−</button>
+          <span>${r.n}${esc(unit)}</span>
+          <button data-action="rc-n" data-i="${i}" data-d="1">＋</button>
+        </div></div>` : it?.kind === 'level' ? '<div class="rc-n"><span class="sub">「たっぷり」にします</span></div>' : ''}
+    </li>`;
+  }).join('');
+  const use = sheet.rows.filter(r => r.choice !== 'skip').length;
+  return `${head('レシートの中身')}
+    <p class="muted small">${esc([sheet.meta.store, sheet.meta.date].filter(Boolean).join('　'))}${sheet.rows.length ? '' : '品目が見つかりませんでした。'}</p>
+    <ul class="list">${rows}</ul>
+    <div class="sheet-foot">
+      <button class="primary big" data-action="rc-apply" ${use ? '' : 'disabled'}>${use ? `在庫に入れる（${use} 品）` : '在庫に入れる物がありません'}</button>
+      <button class="ghost" data-action="receipt">撮り直す</button>
+    </div>`;
+}
+
+async function startReceipt(file) {
+  sheet = { type: 'receipt', phase: 'reading' };
+  render();
+  try {
+    const [result, meta] = await Promise.all([readReceipt(file, items, store.test), store.getMeta('receipt')]);
+    if (sheet?.type !== 'receipt') return; // 読んでいる間に閉じた
+    const skip = meta.skip || [];
+    sheet = { type: 'receipt', phase: 'review', meta: { store: result.store, date: result.date }, skip, rows: planReceipt(items, result, skip) };
+  } catch (e) {
+    console.error(e);
+    if (sheet?.type !== 'receipt') return;
+    sheet = { type: 'receipt', phase: 'error', error: e?.code || e?.message || String(e) };
+  }
+  render();
+}
+
+async function applyReceiptSheet() {
+  const { rows, meta, skip } = sheet;
+  const out = applyReceipt(items, rows, meta);
+  if (out.updates.length) await store.batch(out.updates);
+  for (const c of out.creates) await store.add(c);
+  for (const l of out.logs) store.log(l);
+  // 読み飛ばしを覚える。今回品目を選んだ物は、読み飛ばしから外す。
+  const used = new Set(rows.filter(r => r.choice !== 'skip').map(r => r.text));
+  const nextSkip = [...new Set([...skip.filter(t => !used.has(t)), ...out.skipAdd])];
+  if (nextSkip.join('\n') !== skip.join('\n')) store.setMeta('receipt', { skip: nextSkip });
+  sheet = null;
+  toast(`${out.updates.length + out.creates.length} 品を在庫に入れました`);
+  render();
 }
 
 // よくある品目の一覧。緑＝うちで使う物。押すたびに緑と白が切り替わる。
@@ -330,12 +408,24 @@ document.addEventListener('click', async e => {
       if (!sheet.confirmDelete) { sheet.confirmDelete = true; render(); syncKindFields(); return; }
       store.remove(id); sheet = null; toast(`${it.name} を消しました`); return;
     case 'signout': store.signOut(); return;
+    case 'receipt': document.getElementById('receipt-file').click(); return;
+    case 'rc-n': { const r = sheet.rows[el.dataset.i]; r.n = Math.max(1, r.n + Number(el.dataset.d)); render(); return; }
+    case 'rc-apply': return applyReceiptSheet();
   }
 });
 
 document.addEventListener('change', e => {
   if (e.target.name === 'kind') syncKindFields();
   if (e.target.name === 't') syncTplButton();
+  if (e.target.id === 'receipt-file' && e.target.files[0]) { startReceipt(e.target.files[0]); e.target.value = ''; }
+  if (e.target.dataset.rc != null) {
+    const r = sheet.rows[e.target.dataset.rc];
+    r.choice = e.target.value;
+    const it = byId(r.choice);
+    // 選び直したら、足す数をその品目に合わせる
+    r.n = it?.kind === 'count' ? (r.units ?? r.qty * (it.buyQty || 1)) : (r.units ?? r.qty);
+    render();
+  }
 });
 
 document.addEventListener('input', e => {

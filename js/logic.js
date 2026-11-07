@@ -74,3 +74,56 @@ export function matches(it, q) {
   const k = toHira(q.trim());
   return [it.name, ...(it.aliases || [])].some(n => toHira(n).includes(k));
 }
+
+// ---------- レシート ----------
+// 名前の比べ方：ひらがな・カタカナ、全角・半角、空白を区別しない（半角カナもそろえる）
+export function receiptKey(s) {
+  return toHira(String(s).normalize('NFKC').replace(/\s+/g, ''));
+}
+
+// 読み取った行に、最初の選び方を付ける。
+//   choice：品目の id ／ 'new'（新しい品目として足す）／ 'skip'（読み飛ばす）
+//   n：在庫に足す数（個数の品目と新しい品目のとき）
+// 前に覚えた呼び方（aliases）と読み飛ばし（skip）を、AI の当てはめより優先する。
+export function planReceipt(items, result, skip = []) {
+  const skipSet = new Set(skip.map(receiptKey));
+  return result.lines.map(l => {
+    const text = String(l.text || l.name || '').trim();
+    const k = receiptKey(text);
+    const qty = Math.max(1, Math.round(Number(l.qty) || 1));
+    const units = Number(l.units) > 0 ? Math.round(Number(l.units)) : null;
+    const remembered = items.find(i => i.aliases.some(a => receiptKey(a) === k));
+    const byAi = items.find(i => i.name === l.item);
+    const hit = remembered || byAi;
+    const choice = hit ? hit.id : 'skip';
+    // 一覧になく、読み飛ばしとしても覚えていない物は「選んでください」の印を付けて、読み飛ばしを仮に選んでおく
+    const unsure = !hit && !skipSet.has(k);
+    const n = hit && hit.kind === 'count' ? (units ?? qty * (hit.buyQty || 1)) : (units ?? qty);
+    return { text, name: String(l.name || text).trim(), price: Number(l.price) || null, qty, units, choice, n, unsure };
+  });
+}
+
+// 選んだ内容を、在庫の書き換え・新しい品目・記録・覚える読み飛ばしにする
+export function applyReceipt(items, rows, meta = {}) {
+  const patches = new Map(); // id → patch
+  const creates = [], logs = [], skipAdd = [];
+  for (const r of rows) {
+    if (r.choice === 'skip') { if (r.text) skipAdd.push(r.text); continue; }
+    if (r.choice === 'new') {
+      creates.push(normalize({ name: r.name, kind: 'count', unit: '個', qty: r.n, threshold: 0, buyQty: r.n, aliases: r.text && r.text !== r.name ? [r.text] : [], category: 'その他' }));
+      logs.push({ type: 'buy', name: r.name, qty: r.n, price: r.price, store: meta.store || '', date: meta.date || '', source: 'レシート' });
+      continue;
+    }
+    const it = items.find(i => i.id === r.choice);
+    if (!it) continue;
+    const p = patches.get(it.id) || { onList: false, cart: false };
+    if (it.kind === 'count') p.qty = (p.qty ?? it.qty ?? 0) + r.n;
+    if (it.kind === 'level') p.level = 'たっぷり';
+    // レシートでの書き方を覚える（次からは AI に頼らず同じ品目にする）
+    const known = [it.name, ...it.aliases, ...(p.aliases || [])].some(a => receiptKey(a) === receiptKey(r.text));
+    if (r.text && !known) p.aliases = [...(p.aliases || it.aliases), r.text];
+    patches.set(it.id, p);
+    logs.push({ type: 'buy', itemId: it.id, name: it.name, qty: it.kind === 'count' ? r.n : null, price: r.price, store: meta.store || '', date: meta.date || '', source: 'レシート' });
+  }
+  return { updates: [...patches].map(([id, patch]) => ({ id, patch })), creates, logs, skipAdd };
+}
