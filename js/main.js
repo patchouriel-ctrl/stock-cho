@@ -3,7 +3,7 @@ import { testStore, currentUser, signIn, firebaseStore } from './data.js';
 import { TEMPLATE, CATEGORIES } from './template.js';
 import { LEVELS, normalize, stockText, isUnknown, lowReason, shoppingList, afterBuy, matches } from './logic.js';
 
-export const VERSION = 'v1';
+export const VERSION = 'v2';
 const TEST = new URLSearchParams(location.search).has('test');
 const $app = document.getElementById('app');
 
@@ -12,6 +12,19 @@ let items = [];
 let tab = 'shop';
 let query = '';
 let sheet = null; // 開いている下からの画面 { type: 'edit', id } / { type: 'template' }
+
+// ピンチやダブルタップで画面が拡大されないようにする（iPhone の Safari は viewport の指定だけでは拡大を止めない）
+for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
+  document.addEventListener(type, e => e.preventDefault(), { passive: false });
+}
+document.addEventListener('touchmove', e => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+// 押す場所以外を素早く 2 回たたいたときは、2 回目を無かったことにする
+let lastTap = 0;
+document.addEventListener('touchend', e => {
+  const now = Date.now();
+  if (now - lastTap < 350 && !e.target.closest('button, input, select, textarea, label, a')) e.preventDefault();
+  lastTap = now;
+}, { passive: false });
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const byId = id => items.find(i => i.id === id);
@@ -85,6 +98,10 @@ function tabBtn(key, label, badge) {
 function shopView({ low, manual, unknown }) {
   if (!items.length) return emptyStart();
   const inCart = items.filter(i => i.cart).length;
+  // かごに入れていない行には、右に「外す」（自分で入れた物）か「在庫を直す」（在庫が少ない物）を出す
+  const fixBtn = (it, reason) => it.cart ? '' : reason === 'リストに追加'
+    ? `<button class="row-x" data-action="unlist" data-id="${it.id}">外す</button>`
+    : `<button class="row-x" data-action="fixstock" data-id="${it.id}">在庫を直す</button>`;
   const rows = arr => arr.map(({ it, reason }) => `
     <li class="shop-row ${it.cart ? 'done' : ''}">
       <button class="check" data-action="cart" data-id="${it.id}" aria-label="かごに入れた">${it.cart ? '✓' : ''}</button>
@@ -98,6 +115,7 @@ function shopView({ low, manual, unknown }) {
           <span>${it.buyQty}${esc(it.unit)}</span>
           <button data-action="buyqty" data-id="${it.id}" data-d="1">＋</button>
         </div>` : ''}
+      ${fixBtn(it, reason)}
     </li>`).join('');
   return `
     <header class="head"><h1>今日の買い物</h1></header>
@@ -111,7 +129,7 @@ function shopView({ low, manual, unknown }) {
 function emptyStart() {
   return `<div class="center">
     <h2>まず、うちで使う物を選びましょう</h2>
-    <p class="muted">よくある品目から、チェックを付けるだけです。在庫の数は、あとで分かったものから入れれば大丈夫です。</p>
+    <p class="muted">よくある品目の一覧から、家で使う物を押していくだけです。在庫の数は、あとで分かったものから入れれば大丈夫です。</p>
     <button class="primary big" data-action="open-template">よくある品目から選ぶ</button>
     <button class="ghost" data-action="new">自分で品目を足す</button>
   </div>`;
@@ -163,7 +181,7 @@ function settingsView() {
   return `
     <header class="head"><h1>設定</h1></header>
     <ul class="list plain">
-      <li><button class="row-btn" data-action="open-template">よくある品目から足す</button></li>
+      <li><button class="row-btn" data-action="open-template">うちで使う物を選ぶ（よくある品目から足す・外す）</button></li>
       <li><button class="row-btn" data-action="new">自分で品目を足す</button></li>
     </ul>
     <h2 class="sec">アカウント</h2>
@@ -180,32 +198,55 @@ function sheetView() {
     <div class="sheet">${sheet.type === 'template' ? templateSheet() : sheet.type === 'qty' ? qtySheet() : editSheet()}</div>`;
 }
 
+// 在庫の量を直す画面（在庫タブの数字、買い物タブの「在庫を直す」から開く）
 function qtySheet() {
   const it = byId(sheet.id);
   if (!it) { sheet = null; return ''; }
+  if (it.kind === 'level') {
+    return `
+    <div class="sheet-head"><h2>${esc(it.name)} はいまどのくらい？</h2><button class="ghost" data-action="close-sheet">閉じる</button></div>
+    <div class="level-pick">${LEVELS.map(l => `<button data-action="picklevel" data-level="${l}" class="${it.level === l ? 'on' : ''} lv-${l}">${l}</button>`).join('')}</div>
+    ${it.onList ? `<button class="ghost" data-action="unlist" data-id="${it.id}">買い物リストから外すだけ（在庫は直さない）</button>` : ''}`;
+  }
   return `
     <div class="sheet-head"><h2>${esc(it.name)} はいま何${esc(it.unit)}？</h2><button class="ghost" data-action="close-sheet">閉じる</button></div>
     <div class="numpad">${Array.from({ length: 13 }, (_, n) => `<button data-action="pickqty" data-n="${n}" class="${it.qty === n ? 'on' : ''}">${n}</button>`).join('')}</div>
     <form id="qty-form" class="row-form">
       <input name="qty" type="number" inputmode="numeric" min="0" placeholder="ほかの数" value="">
       <button class="primary" type="submit">決定</button>
+    </form>
+    ${it.onList ? `<button class="ghost" data-action="unlist" data-id="${it.id}">買い物リストから外すだけ（在庫は直さない）</button>` : ''}`;
+}
+
+// よくある品目の一覧。緑＝うちで使う物。押すたびに緑と白が切り替わる。
+// 最初は何も選ばれていない。すでに追加した物は緑で始まり、白にすると外せる。
+function templateSheet() {
+  const have = new Set(items.map(i => i.name));
+  return `
+    <div class="sheet-head"><h2>うちで使う物を選ぶ</h2><button class="ghost" data-action="close-sheet">閉じる</button></div>
+    <p class="muted small">家で使う物を押して<b class="ok">緑</b>にしてください。もう一度押すと外れます。</p>
+    <form id="tpl-form">
+      ${CATEGORIES.filter(c => TEMPLATE.some(t => t.category === c)).map(c => `<h3 class="sec">${esc(c)}</h3><div class="chips">
+        ${TEMPLATE.filter(t => t.category === c).map(t => `<label class="chip"><input type="checkbox" name="t" value="${esc(t.name)}" ${have.has(t.name) ? 'checked data-had' : ''}><span>${esc(t.name)}</span></label>`).join('')}
+      </div>`).join('')}
+      <div class="sheet-foot"><button class="primary big" type="submit" data-tpl-submit disabled>品目を選んでください</button></div>
     </form>`;
 }
 
-function templateSheet() {
-  const have = new Set(items.map(i => i.name));
-  const rest = TEMPLATE.filter(t => !have.has(t.name));
-  const cats = CATEGORIES.filter(c => rest.some(t => t.category === c));
-  return `
-    <div class="sheet-head"><h2>よくある品目から選ぶ</h2><button class="ghost" data-action="close-sheet">閉じる</button></div>
-    ${!rest.length ? '<p class="empty">ひな形の品目はすべて追加済みです</p>' : `
-    <p class="muted small">うちで使う物にチェックしてください。あとから消すこともできます。</p>
-    <form id="tpl-form">
-      ${cats.map(c => `<h3 class="sec">${esc(c)}</h3><div class="chips">
-        ${rest.filter(t => t.category === c).map(t => `<label class="chip"><input type="checkbox" name="t" value="${esc(t.name)}" checked><span>${esc(t.name)}</span></label>`).join('')}
-      </div>`).join('')}
-      <button class="primary big" type="submit">選んだ品目を追加</button>
-    </form>`}`;
+// 押した数に合わせて、決定ボタンの文字を変える（何が起きるかを押す前に分かるように）
+function tplChanges() {
+  const f = document.getElementById('tpl-form');
+  const boxes = [...f.querySelectorAll('input[name=t]')];
+  const add = boxes.filter(b => b.checked && !b.hasAttribute('data-had')).map(b => b.value);
+  const drop = boxes.filter(b => !b.checked && b.hasAttribute('data-had')).map(b => b.value);
+  return { f, add, drop };
+}
+function syncTplButton() {
+  const { f, add, drop } = tplChanges();
+  const btn = f.querySelector('[data-tpl-submit]');
+  const parts = [add.length && `${add.length} 品目を追加`, drop.length && `${drop.length} 品目を外す`].filter(Boolean);
+  btn.disabled = !parts.length;
+  btn.textContent = parts.length ? parts.join('・') : (items.length ? '変更はありません' : '品目を選んでください');
 }
 
 function editSheet() {
@@ -213,7 +254,12 @@ function editSheet() {
   if (!it) { sheet = null; return ''; }
   const cats = [...new Set([...CATEGORIES, ...items.map(i => i.category)])];
   return `
-    <div class="sheet-head"><h2>${sheet.id ? '品目を編集' : '品目を足す'}</h2><button class="ghost" data-action="close-sheet">閉じる</button></div>
+    <div class="sheet-head"><h2>${sheet.id ? '品目を編集' : '品目を足す'}</h2>
+      <div class="head-btns">
+        ${sheet.id ? `<button class="ghost danger ${sheet.confirmDelete ? 'confirm' : ''}" type="button" data-action="delete" data-id="${it.id}">${sheet.confirmDelete ? 'もう一度押すと消えます' : '消す'}</button>` : ''}
+        <button class="ghost" data-action="close-sheet">閉じる</button>
+      </div>
+    </div>
     <form id="edit-form">
       <label class="field">名前<input name="name" required value="${esc(it.name)}" placeholder="例：卵"></label>
       <label class="field">分類<select name="category">${cats.map(c => `<option ${c === it.category ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>
@@ -231,7 +277,6 @@ function editSheet() {
       </div>
       <label class="field">ほかの呼び方（声やレシート用。「、」で区切る）<input name="aliases" value="${esc(it.aliases.join('、'))}" placeholder="例：たまご、玉子"></label>
       <button class="primary big" type="submit">保存</button>
-      ${sheet.id ? `<button class="ghost danger" type="button" data-action="delete" data-id="${it.id}">${sheet.confirmDelete ? 'もう一度押すと消えます' : 'この品目を消す'}</button>` : ''}
     </form>`;
 }
 
@@ -262,8 +307,16 @@ document.addEventListener('click', async e => {
     case 'buyqty': store.update(id, { buyQty: Math.max(1, it.buyQty + Number(el.dataset.d)) }); return;
     case 'finish': return finishShopping();
     case 'qty': store.update(id, { qty: Math.max(0, (it.qty ?? 0) + Number(el.dataset.d)) }); return;
-    case 'setqty': sheet = { type: 'qty', id }; render(); document.querySelector('#qty-form input')?.focus(); return;
-    case 'pickqty': store.update(sheet.id, { qty: Number(el.dataset.n) }); sheet = null; render(); return;
+    case 'setqty': sheet = { type: 'qty', id }; render(); return;
+    // 買い物タブの「在庫を直す」から開いたときは、直したらリストからも外す（「まだあった」という意味なので）
+    case 'pickqty': store.update(sheet.id, { qty: Number(el.dataset.n), ...(sheet.fromShop ? { onList: false } : {}) }); sheet = null; render(); return;
+    case 'picklevel': store.update(sheet.id, { level: el.dataset.level, ...(sheet.fromShop ? { onList: false } : {}) }); sheet = null; render(); return;
+    case 'unlist':
+      sheet = null;
+      store.update(id, { onList: false, cart: false });
+      toast(`${it.name} を買い物リストから外しました`);
+      return;
+    case 'fixstock': sheet = { type: 'qty', id, fromShop: true }; render(); return;
     case 'level': store.update(id, { level: it.level === el.dataset.level ? null : el.dataset.level }); return;
     case 'onlist':
       store.update(id, { onList: !it.onList });
@@ -271,7 +324,7 @@ document.addEventListener('click', async e => {
       return;
     case 'edit': sheet = { type: 'edit', id }; render(); syncKindFields(); return;
     case 'new': sheet = { type: 'edit', id: null }; render(); syncKindFields(); return;
-    case 'open-template': sheet = { type: 'template' }; render(); return;
+    case 'open-template': sheet = { type: 'template' }; render(); syncTplButton(); return;
     case 'close-sheet': sheet = null; render(); return;
     case 'delete':
       if (!sheet.confirmDelete) { sheet.confirmDelete = true; render(); syncKindFields(); return; }
@@ -282,6 +335,7 @@ document.addEventListener('click', async e => {
 
 document.addEventListener('change', e => {
   if (e.target.name === 'kind') syncKindFields();
+  if (e.target.name === 't') syncTplButton();
 });
 
 document.addEventListener('input', e => {
@@ -299,16 +353,18 @@ document.addEventListener('submit', async e => {
   const f = e.target;
   if (f.id === 'qty-form') {
     const n = Number(f.qty.value);
-    if (f.qty.value !== '' && Number.isFinite(n) && n >= 0) store.update(sheet.id, { qty: Math.floor(n) });
+    if (f.qty.value !== '' && Number.isFinite(n) && n >= 0) store.update(sheet.id, { qty: Math.floor(n), ...(sheet.fromShop ? { onList: false } : {}) });
     sheet = null;
     render();
   }
   if (f.id === 'tpl-form') {
-    const names = new FormData(f).getAll('t');
-    for (const t of TEMPLATE.filter(t => names.includes(t.name))) await store.add(normalize(t));
+    const { add, drop } = tplChanges();
+    for (const t of TEMPLATE.filter(t => add.includes(t.name))) await store.add(normalize(t));
+    for (const it of items.filter(i => drop.includes(i.name))) await store.remove(it.id);
     sheet = null;
     tab = 'stock';
-    toast(`${names.length} 品目を追加しました`);
+    toast(add.length && drop.length ? `${add.length} 品目を追加し、${drop.length} 品目を外しました`
+      : add.length ? `${add.length} 品目を追加しました` : `${drop.length} 品目を外しました`);
     render();
   }
   if (f.id === 'edit-form') {
